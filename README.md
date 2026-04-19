@@ -49,7 +49,7 @@ ln -s /path/to/ccsession/skill ~/.claude/skills/ccsession
 
 ### 示例：`/ccsession list`
 
-```
+```markdown
 # Claude Code 会话摘要 — `/path/to/project`
 
 共 **3** 个会话。
@@ -65,7 +65,7 @@ ln -s /path/to/ccsession/skill ~/.claude/skills/ccsession
 
 ### 示例：`/ccsession show <sessionId>`
 
-```
+```markdown
 # 会话详情 — `a3b370e5-2c63-42e3-831f-65744c89b44a`
 
 | 会话ID | 模型 | 时间 | 问题摘要 | 首个问题 | AI 执行摘要 | 文件编辑 | Subagent | Token 用量 |
