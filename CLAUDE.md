@@ -42,14 +42,6 @@ python3 skill/scripts/parse_sessions.py --project "$PWD" --mode detail --session
 
 Python 3 标准库，无第三方包。
 
-## 规则
-
-- **提交前必做**：每次 `git commit` 前，必须执行以下步骤：
-  1. 检查本次代码变更是否涉及新功能、新参数、架构变化
-  2. 如有，先更新 `README.md`（功能、用法、结构等）
-  3. 如有新的设计决策或规则，先更新 `CLAUDE.md`
-  4. 确认文档更新后再执行提交
-
 ## 远程仓库
 
 SSH: `git@github.com:legdonkey/ccsession.git`
