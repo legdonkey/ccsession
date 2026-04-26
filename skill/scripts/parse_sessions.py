@@ -449,6 +449,18 @@ def render_detail(s: SessionStats, full: bool = False, step_preview: int = 3) ->
     return "\n".join(out)
 
 
+def _duration_secs(s: SessionStats) -> float:
+    """会话时长（秒），用于排序。空 start/end 或解析失败时返回 0.0。"""
+    if not (s.start and s.end):
+        return 0.0
+    try:
+        a = datetime.fromisoformat(s.start.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(s.end.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return max(0.0, (b - a).total_seconds())
+
+
 def _aggregate_safe(path: Path) -> SessionStats:
     """aggregate() 包一层异常隔离——单个会话解析失败不拖垮整批。"""
     try:
@@ -511,9 +523,10 @@ def main() -> int:
     ap.add_argument("--session", default=None, help="detail 模式下必须指定 sessionId")
     ap.add_argument("--full", action="store_true", help="detail 模式展示全部步骤（默认只展示前 3 步）")
     ap.add_argument("--format", choices=["markdown", "json"], default="markdown", help="输出格式")
-    ap.add_argument("--sort", choices=["start", "end", "turns", "duration"], default="start",
-                    help="summary 排序字段（默认 start）")
-    ap.add_argument("--desc", action="store_true", help="降序排列（默认升序）")
+    ap.add_argument("--sort", choices=["start", "end", "turns", "duration"], default=None,
+                    help="单字段排序；不指定时按 end DESC → user_turns DESC → duration DESC 多键排序")
+    ap.add_argument("--desc", action="store_true",
+                    help="降序排列（仅在显式传 --sort 时生效；默认多键排序已是 desc）")
     ap.add_argument("--workers", type=int, default=0,
                     help="summary 模式并发线程数；0=自动（min(8, cpu)），1=串行")
     args = ap.parse_args()
@@ -528,18 +541,17 @@ def main() -> int:
     if args.mode == "summary":
         rows = _aggregate_all(files, args.workers)
 
-        def sort_key(s: SessionStats):
-            if args.sort == "turns":
-                return s.user_turns
-            if args.sort == "duration":
-                a = datetime.fromisoformat(s.start.replace("Z", "+00:00")) if s.start else datetime.min.replace(tzinfo=None)
-                b = datetime.fromisoformat(s.end.replace("Z", "+00:00")) if s.end else a
-                return (b - a).total_seconds()
-            if args.sort == "end":
-                return s.end or ""
-            return s.start or ""
-
-        rows.sort(key=sort_key, reverse=args.desc)
+        if args.sort is None:
+            # 默认多键全 DESC：end → user_turns → duration
+            # 设计动机：用户最常关心"最近活跃 + 互动密度高 + 跑得久"的会话排前面
+            rows.sort(key=lambda s: (s.end or "", s.user_turns, _duration_secs(s)), reverse=True)
+        else:
+            def single_key(s: SessionStats):
+                if args.sort == "turns":    return s.user_turns
+                if args.sort == "duration": return _duration_secs(s)
+                if args.sort == "end":      return s.end or ""
+                return s.start or ""
+            rows.sort(key=single_key, reverse=args.desc)
         if args.format == "json":
             data = [_session_to_dict(s) for s in rows]
             print(json.dumps(data, ensure_ascii=False, indent=2))

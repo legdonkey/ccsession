@@ -28,7 +28,11 @@ argument-hint: "[list|show|delete|procs|kill] [--project <path>] [<sessionId>|<p
 
 ```bash
 # 所有命令统一用 --format json，脚本只输出数据，渲染由 Claude 完成
+# summary 默认排序：end DESC → user_turns DESC → duration DESC（什么都不传即可）
 python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode summary --format json
+# 单键排序：传 --sort 即回退；可配 --desc
+python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode summary --format json --sort start
+python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode summary --format json --sort turns --desc
 python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode detail --session <id> --format json
 python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode detail --session <id> --format json --full
 python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --session <id>          # 仅预览
@@ -70,9 +74,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 ### `/ccsession list` 执行流程
 
 1. 解析 `--project`，缺省取用户当前 `$PWD`。
-2. 调 `parse_sessions.py --mode summary --format json`，获取 JSON 数组。
+2. 调 `parse_sessions.py --mode summary --format json`，获取 JSON 数组。脚本**默认按 `end DESC → user_turns DESC → duration DESC` 三级倒序**输出（最近活跃 + 高互动 + 长时段会话排前面）；如需别的排序，加 `--sort {start|end|turns|duration}` + 可选 `--desc`，这两个参数仅在显式传 `--sort` 时生效。
 3. 对每个会话按"会话摘要 Prompt 模板"一行润色（脚本已提供 `raw_summary` / `commits` / `last_prompt` / `first_question` 候选）。
-4. 按表格行格式渲染每个会话（多行表格 + 表头）。
+4. 按表格行格式渲染每个会话（多行表格 + 表头）。**保持脚本返回的顺序**，不要在 Claude 这层重新排序。
 5. 多个会话时，底部加合计 tokens 行（合计包含 subagent tokens）。
 6. 作为文本回复发出。
 

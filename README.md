@@ -153,6 +153,7 @@ _…共 58 步，还有 55 步未展示。加_ _`--full`_ _查看全部：`/ccse
 
 | 日期 | 变更类型 | 变更描述 |
 |---|---|---|
+| 2026-04-26 | 用户体验 | `list` 默认按 `end DESC → user_turns DESC → duration DESC` 三级倒序，最近活跃 + 高互动 + 长时段会话排前面；`--sort` 显式传值时回退单键模式，与 `--desc` 配合 |
 | 2026-04-26 | bug 修复 | `delete` 连带删除同名 sessionId 子目录（含该会话独有的 `subagents/` 与 `tool-results/`），避免 subagent / tool-results 残留为孤儿数据；新增 `clean-orphan-dirs` 子命令清理历史遗留；安全断言三道（UUID 正则 + 父目录 + 同名）防误伤项目级共享目录 |
 | 2026-04-26 | 性能优化 | summary 模式默认线程池并发聚合（每个会话独立 IO + git log 子进程），新增 `--workers` 参数（0=自动 `min(8, cpu)`、1=串行）；本机 10 个会话实测 0.31s → 0.20s |
 | 2026-04-26 | 功能精修 | 会话摘要不限字数、SKILL.md 改写为 Prompt 模板；`first_question` / `last_prompt` 不截断；恢复 Subagent 子表格；`raw_summary` 改从 `type==user + isCompactSummary` 抽取（即 `/compact` 留下的前序压缩） |
