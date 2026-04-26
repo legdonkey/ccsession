@@ -17,7 +17,8 @@ argument-hint: "[list|show|delete|procs|kill] [--project <path>] [<sessionId>|<p
 | `/ccsession list [--project <路径>]` | 表格列出该项目所有会话 |
 | `/ccsession show <sessionId>` | 详情：单行摘要表 + 用户提问 + 前 3 步 |
 | `/ccsession show <sessionId> --full` | 详情：单行摘要表 + 用户提问 + 全部步骤 |
-| `/ccsession delete <sessionId>` | 删除某条会话的 .jsonl（需用户确认） |
+| `/ccsession delete <sessionId>` | 删除某条会话的 .jsonl 与同名 sessionId 子目录（两步确认） |
+| `/ccsession clean-orphan-dirs` | 清理项目目录下所有无对应 .jsonl 的孤儿 sessionId 子目录（两步确认） |
 | `/ccsession procs` | 列出 Claude Code 退出后留下的孤儿子进程 |
 | `/ccsession kill <pid>[,<pid>...]` | 清理指定孤儿进程（两步确认；SIGTERM→5s→SIGKILL） |
 
@@ -31,7 +32,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mod
 python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode detail --session <id> --format json
 python3 "${CLAUDE_SKILL_DIR}/scripts/parse_sessions.py" --project <路径> --mode detail --session <id> --format json --full
 python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --session <id>          # 仅预览
-python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --session <id> --force  # 实际删除
+python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --session <id> --force  # 实际删除（jsonl + 同名子目录）
+python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --clean-orphan-dirs          # 仅预览孤儿子目录
+python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --clean-orphan-dirs --force  # 实际清理
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode list --format json
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode kill --pids <ids> --format json          # 仅预览
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode kill --pids <ids> --format json --force  # 实际终止
@@ -129,10 +132,18 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 
 ### `/ccsession delete <sessionId>`
 
-1. **先**调不带 `--force` 的 `delete_session.py`，获得会话概要 + 目标文件路径。
+1. **先**调不带 `--force` 的 `delete_session.py`，获得会话概要 + 目标文件路径 + 同名子目录路径与大小（如存在）。
 2. 把概要展示给用户，**必须**明文询问「确认永久删除？(yes / no)」。
 3. 仅当用户回复明确肯定（`yes` / `y` / `确认` 等）时，再加 `--force` 重新调用。
-4. 任何情况下**只删除目标 `.jsonl`**，绝不触碰同目录下其它文件或子目录（如 `memory/`、`todos/`）。
+4. 删除范围：目标 `.jsonl` **以及与之同名的 sessionId 子目录**（如存在；含该会话独有的 `subagents/` 与 `tool-results/`）。**绝不触碰**项目级共享内容（如 `memory/`、`todos/`、`shellsnapshots/`、`.ccsession_cache.json`）。脚本对子目录名做严格 UUID 正则校验，校验失败则不动子目录、只删 jsonl。
+
+### `/ccsession clean-orphan-dirs`
+
+1. **先**调不带 `--force` 的 `delete_session.py --clean-orphan-dirs`，获得孤儿子目录列表（每个含文件数 + 字节数 + 合计大小）。
+2. 列表为空时直接告知用户"无孤儿子目录"。
+3. 列表非空时把概要展示给用户，**必须**明文询问「确认永久删除以上 N 个孤儿子目录？(yes / no)」。
+4. 仅当用户明确肯定时，加 `--force` 重新调用。
+5. 删除范围与 delete 同——只动 UUID 命名的子目录，绝不触碰共享目录。
 
 ### `/ccsession procs` 执行流程
 

@@ -7,7 +7,7 @@
 - **列表**：表格展示所有会话，包含会话ID、模型、时间、会话摘要、首个问题、最后提示、AI 执行摘要、文件编辑、Subagent、Token 用量等
 - **详情**：单行摘要 + API 错误（如有）+ 本会话提交 + 文件编辑 + Subagent + AI 执行步骤
 - **会话摘要流水线（事实优先，AI 综合）**：脚本从 jsonl 抽 `last_prompt`、用 `git log --since/--until` 抽本会话期间 cwd 的 commits（最权威信号）、`isCompactSummary` 行抽 `/compact` 留下的前序会话压缩；AI 按 SKILL.md 中"会话摘要 Prompt 模板"综合 `commits → last_prompt → 首末问题 → raw_summary` 生成一句中文摘要，**不限字数**，要求包含所有关键产出或核心意图
-- **删除**：两步确认删除会话 `.jsonl` 文件
+- **删除**：两步确认删除会话 `.jsonl` 与该会话独有的同名 sessionId 子目录（subagent + tool-results 缓存），项目级共享目录（`memory/`、`todos/`、`shellsnapshots/`、`.ccsession_cache.json`）红线保留；附 `clean-orphan-dirs` 子命令清理历史遗留的孤儿子目录
 - **排序**：列表支持按开始时间、结束时间、轮次、时长排序
 - **Token 统计**：主会话 + Subagent 分开展示，支持 k/m/g 单位
 - **API 错误追踪**：统计错误次数、重试次数
@@ -46,7 +46,8 @@ ln -s /path/to/ccsession/skill ~/.claude/skills/ccsession
 | `/ccsession list [--project <path>]` | 表格列出所有会话                        |
 | `/ccsession show <sessionId>`        | 会话详情（默认展示前 3 步）                 |
 | `/ccsession show <sessionId> --full` | 会话详情（展示全部步骤）                    |
-| `/ccsession delete <sessionId>`      | 删除会话 .jsonl（需确认）                |
+| `/ccsession delete <sessionId>`      | 删除会话 .jsonl 与同名 sessionId 子目录（两步确认）  |
+| `/ccsession clean-orphan-dirs`       | 清理项目目录下所有无对应 .jsonl 的孤儿子目录（两步确认） |
 | `/ccsession procs`                   | 列出 Claude Code 退出后的孤儿子进程        |
 | `/ccsession kill <pid>[,<pid>...]`   | 清理孤儿进程（两步确认；SIGTERM→5s→SIGKILL） |
 
@@ -75,9 +76,13 @@ python3 skill/scripts/parse_sessions.py --project /path/to/project \
 python3 skill/scripts/parse_sessions.py --project /path/to/project \
     --mode detail --session <id> --format json --full
 
-# 删除
+# 删除（jsonl + 同名 sessionId 子目录）
 python3 skill/scripts/delete_session.py --project <path> --session <id>          # 预览
 python3 skill/scripts/delete_session.py --project <path> --session <id> --force  # 执行
+
+# 清理孤儿子目录（历史遗留的、无对应 .jsonl 的 sessionId 命名子目录）
+python3 skill/scripts/delete_session.py --project <path> --clean-orphan-dirs          # 预览
+python3 skill/scripts/delete_session.py --project <path> --clean-orphan-dirs --force  # 执行
 
 # 孤儿进程：列表
 python3 skill/scripts/find_orphans.py --project <path> --mode list --format json
@@ -148,6 +153,7 @@ _…共 58 步，还有 55 步未展示。加_ _`--full`_ _查看全部：`/ccse
 
 | 日期 | 变更类型 | 变更描述 |
 |---|---|---|
+| 2026-04-26 | bug 修复 | `delete` 连带删除同名 sessionId 子目录（含该会话独有的 `subagents/` 与 `tool-results/`），避免 subagent / tool-results 残留为孤儿数据；新增 `clean-orphan-dirs` 子命令清理历史遗留；安全断言三道（UUID 正则 + 父目录 + 同名）防误伤项目级共享目录 |
 | 2026-04-26 | 性能优化 | summary 模式默认线程池并发聚合（每个会话独立 IO + git log 子进程），新增 `--workers` 参数（0=自动 `min(8, cpu)`、1=串行）；本机 10 个会话实测 0.31s → 0.20s |
 | 2026-04-26 | 功能精修 | 会话摘要不限字数、SKILL.md 改写为 Prompt 模板；`first_question` / `last_prompt` 不截断；恢复 Subagent 子表格；`raw_summary` 改从 `type==user + isCompactSummary` 抽取（即 `/compact` 留下的前序压缩） |
 | 2026-04-26 | 重构 | 会话摘要改为"事实优先"流水线：脚本承担事实抽取（git commits、last-prompt），AI 综合生成；JSON 字段精简（删 `all_questions` / `question_modes` / `api_error_types` 等冗余） |
