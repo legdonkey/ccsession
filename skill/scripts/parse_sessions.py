@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CACHE_FILENAME = ".ccsession_cache.json"
 
 
 def encode_project_path(abs_path: str) -> str:
@@ -461,6 +462,43 @@ def _duration_secs(s: SessionStats) -> float:
     return max(0.0, (b - a).total_seconds())
 
 
+def _load_cache(project_root: Path) -> dict:
+    """读 .ccsession_cache.json，文件不存在/损坏返回空 summaries。
+
+    list 路径只读，不在这里清孤儿条目（避免读路径写副作用）。
+    """
+    p = project_root / CACHE_FILENAME
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    summaries = data.get("summaries")
+    if not isinstance(summaries, dict):
+        return {}
+    return summaries
+
+
+def _cache_lookup(cache: dict, jsonl_path: Path) -> str:
+    """按 sessionId + mtime + size 三段命中判定，命中返回缓存的摘要文本。"""
+    if not cache:
+        return ""
+    entry = cache.get(jsonl_path.stem)
+    if not isinstance(entry, dict):
+        return ""
+    try:
+        st = jsonl_path.stat()
+    except OSError:
+        return ""
+    if entry.get("mtime") != st.st_mtime or entry.get("size") != st.st_size:
+        return ""
+    summary = entry.get("summary")
+    return summary if isinstance(summary, str) else ""
+
+
 def _aggregate_safe(path: Path) -> SessionStats:
     """aggregate() 包一层异常隔离——单个会话解析失败不拖垮整批。"""
     try:
@@ -484,8 +522,16 @@ def _aggregate_all(files: list[Path], workers: int) -> list[SessionStats]:
         return list(ex.map(_aggregate_safe, files))
 
 
-def _session_to_dict(s: SessionStats, detail: bool = False, full: bool = False) -> dict:
-    """构造给 Claude 渲染的 JSON。字段已按"会话摘要新流水线"精简。"""
+def _session_to_dict(
+    s: SessionStats,
+    detail: bool = False,
+    full: bool = False,
+    cached_summary: str = "",
+) -> dict:
+    """构造给 Claude 渲染的 JSON。字段已按"会话摘要新流水线"精简。
+
+    cached_summary：命中缓存时附该字段；未命中时为空字符串，AI 现场生成并回写。
+    """
     d = {
         "session_id": s.session_id,
         "models": sorted(s.models),
@@ -507,6 +553,7 @@ def _session_to_dict(s: SessionStats, detail: bool = False, full: bool = False) 
         "api_retries": s.api_retries,
         "files_edited": s.files_edited,
         "corrupted_lines": s.corrupted_lines,
+        "cached_summary": cached_summary,
     }
     if detail:
         d["slug"] = s.slug
@@ -538,6 +585,8 @@ def main() -> int:
         print(f"（对应项目路径：{args.project}）")
         return 0
 
+    cache = _load_cache(pdir)
+
     if args.mode == "summary":
         rows = _aggregate_all(files, args.workers)
 
@@ -553,7 +602,10 @@ def main() -> int:
                 return s.start or ""
             rows.sort(key=single_key, reverse=args.desc)
         if args.format == "json":
-            data = [_session_to_dict(s) for s in rows]
+            data = [
+                _session_to_dict(s, cached_summary=_cache_lookup(cache, pdir / f"{s.session_id}.jsonl"))
+                for s in rows
+            ]
             print(json.dumps(data, ensure_ascii=False, indent=2))
         else:
             print(render_summary(args.project, rows))
@@ -570,7 +622,10 @@ def main() -> int:
         return 1
     stats = aggregate(target)
     if args.format == "json":
-        detail_data = _session_to_dict(stats, detail=True, full=args.full)
+        detail_data = _session_to_dict(
+            stats, detail=True, full=args.full,
+            cached_summary=_cache_lookup(cache, target),
+        )
         print(json.dumps(detail_data, ensure_ascii=False, indent=2))
     else:
         print(render_detail(stats, full=args.full))

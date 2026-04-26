@@ -42,6 +42,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/delete_session.py"  --project <路径> --cl
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode list --format json
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode kill --pids <ids> --format json          # 仅预览
 python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mode kill --pids <ids> --format json --force  # 实际终止
+# 摘要回写到持久化缓存（list/show 渲染完成后调一次）
+python3 "${CLAUDE_SKILL_DIR}/scripts/cache_summary.py"   --project <路径> --bulk <json_file>
 ```
 
 脚本只依赖 Python 3 标准库，无第三方包。
@@ -63,7 +65,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 | 会话ID | `session_id` | 前 8 位 |
 | 模型 | `models` | 逗号拼接（如 `claude-opus-4-7, glm-5.1`） |
 | 时间 | `start` `end` `duration` `user_turns` | `{start本地时间} → {end本地时间} · {duration} · {turns} 轮` |
-| 会话摘要 | `raw_summary` / `commits` / `last_prompt` / `first_question` / `tool_counts` → **AI 综合** | 形如 `**{核心一句}**：{展开叙述}`——首句加粗作小标题（≤30 字），冒号后接详细叙述（不限字数，多产出用 `；` 或 `、` 分句，不要用 `<br>`）。详见下方"会话摘要 Prompt 模板" |
+| 会话摘要 | `cached_summary`（命中即用）/ 否则由 `raw_summary` / `commits` / `last_prompt` / `first_question` / `tool_counts` → **AI 综合** | 形如 `**{核心一句}**：{展开叙述}`——首句加粗作小标题（≤30 字），冒号后接详细叙述（不限字数，多产出用 `；` 或 `、` 分句，不要用 `<br>`）。`cached_summary` 非空时**直接逐字塞进表格**（已是成品格式），跳过下方 Prompt 模板；为空时按模板生成并加入"待回写"映射 |
 | 首个问题 | `first_question` | `「{原文}」`——中文引号包裹原文，与摘要的总结性陈述视觉区分；不截断、管道符 `\|` 转义、换行替空格 |
 | 最后提示 | `last_prompt`（缺失时回退 `last_question`） | `「{原文}」`——同上 |
 | AI 执行摘要 | `tool_counts` | 按次数降序：`Edit×27 / Read×24 / Bash×23` |
@@ -75,15 +77,20 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 
 1. 解析 `--project`，缺省取用户当前 `$PWD`。
 2. 调 `parse_sessions.py --mode summary --format json`，获取 JSON 数组。脚本**默认按 `end DESC → user_turns DESC → duration DESC` 三级倒序**输出（最近活跃 + 高互动 + 长时段会话排前面）；如需别的排序，加 `--sort {start|end|turns|duration}` + 可选 `--desc`，这两个参数仅在显式传 `--sort` 时生效。
-3. 对每个会话按"会话摘要 Prompt 模板"一行润色（脚本已提供 `raw_summary` / `commits` / `last_prompt` / `first_question` 候选）。
+3. **对每个会话决定摘要来源**：
+   - JSON 中 `cached_summary` 非空 → **直接用作"会话摘要"列**（已是成品文本，逐字塞进表格、不再加工）。
+   - `cached_summary` 为空 → 按"会话摘要 Prompt 模板"现场生成；同时把 `(sessionId, 生成的摘要文本)` 收集到"待回写"映射。
 4. 按表格行格式渲染每个会话（多行表格 + 表头）。**保持脚本返回的顺序**，不要在 Claude 这层重新排序。
-5. 多个会话时，底部加合计 tokens 行（合计包含 subagent tokens）。
-6. 作为文本回复发出。
+5. **若"待回写"映射非空** → 用 Bash 把映射写入临时 JSON（如 `/tmp/ccsession_writeback_$$.json`），再调
+   `python3 ${CLAUDE_SKILL_DIR}/scripts/cache_summary.py --project <path> --bulk <临时文件>` 回写持久化缓存，最后删掉临时文件。仅在本次有新生成的摘要时才需要这一步。
+6. 多个会话时，底部加合计 tokens 行（合计包含 subagent tokens）。
+7. 作为文本回复发出。
 
 ### `/ccsession show <sessionId>` 执行流程
 
 1. 调 `parse_sessions.py --mode detail --session <id> --format json`，获取 JSON 对象。
-2. 按"会话摘要 Prompt 模板"生成会话摘要。
+2. **决定会话摘要来源**：JSON 中 `cached_summary` 非空 → 直接用；为空 → 按"会话摘要 Prompt 模板"现场生成，并在渲染完成后调
+   `python3 ${CLAUDE_SKILL_DIR}/scripts/cache_summary.py --project <path> --bulk <临时文件>` 回写（临时文件内容形如 `{"<sessionId>": "<摘要>"}`）。
 3. **第一部分：单行摘要表格**（与 list 行格式完全一致，只有一行）。
    ```
    # 会话详情 — `{session_id}`
@@ -193,9 +200,20 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 
 ---
 
+## 摘要持久化缓存（list/show 共用）
+
+为消除多会话项目下 AI 摘要的瓶颈，脚本会从 `{project_dir}/.ccsession_cache.json` 读取已生成的摘要：按 `sessionId + jsonl mtime + jsonl size` 三段命中。
+
+- 命中 → JSON 中 `cached_summary` 字段为成品文本（已含粗体首句），**直接用、不再加工**。
+- 未命中 → `cached_summary` 为空字符串；按下方 Prompt 模板生成；渲染完成后通过 `cache_summary.py --bulk` 回写。
+
+**回写脚本约定**：临时 JSON 形如 `{"<sessionId>": "<摘要文本>"}`；脚本会重新 stat 对应 jsonl 取 mtime+size 后写入；不存在 jsonl 的 sessionId 会被静默跳过。回写后删除临时文件。
+
+**缓存淘汰**：删除 session 时（`delete_session.py`）同步清条目；list/show 路径只读不写；mtime/size 不一致自动判 miss 触发重算。**绝不在 list 路径里清孤儿条目**（避免读路径写副作用）。
+
 ## 会话摘要 Prompt 模板
 
-为每个会话生成「会话摘要」列时，按下面这套 Prompt 自我引导：
+为每个会话生成「会话摘要」列时（仅 `cached_summary` 为空时执行），按下面这套 Prompt 自我引导：
 
 > 你正在为一段 Claude Code 会话生成「会话摘要」。
 >

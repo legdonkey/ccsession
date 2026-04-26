@@ -16,6 +16,7 @@ from parse_sessions import (  # noqa: E402
     project_dir,
     render_detail,
 )
+from cache_summary import purge_entry as _purge_cache_entry  # noqa: E402
 
 # UUID 正则——sessionId 必须严格匹配，否则不连带删同名目录
 SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -80,6 +81,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(f"✅ 已删除子目录：{sub_dir}")
     target.unlink()
     print(f"✅ 已删除：{target}")
+    # 同步清缓存中该 sessionId 的摘要条目（若存在）
+    if _purge_cache_entry(project_root, session_id):
+        print(f"✅ 已清理缓存中的摘要条目：{session_id}")
     return 0
 
 
