@@ -47,7 +47,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 
 每个会话渲染为一行，列为：
 
-`| 会话ID | 模型 | 时间 | 问题摘要 | 首个问题 | 最后问题 | AI 执行摘要 | 文件编辑 | Subagent | Token 用量 |`
+`| 会话ID | 模型 | 时间 | 会话摘要 | 首个问题 | 最后提示 | AI 执行摘要 | 文件编辑 | Subagent | Token 用量 |`
 
 各列取值规则：
 
@@ -56,19 +56,19 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 | 会话ID | `session_id` | 前 8 位 |
 | 模型 | `models` | 逗号拼接（如 `claude-opus-4-7, glm-5.1`） |
 | 时间 | `start` `end` `duration` `user_turns` | `{start本地时间} → {end本地时间} · {duration} · {turns} 轮` |
-| 问题摘要 | `all_questions` → **AI 生成** | 一句中文 ≤60 字，综合所有提问归纳 |
+| 会话摘要 | `raw_summary` / `commits` / `last_prompt` / `first_question` → **AI 一行润色** | 一句中文 ≤60 字，详见下方"会话摘要生成规则" |
 | 首个问题 | `first_question` | 原样，末尾加 `…` |
-| 最后问题 | `last_question` | 原样，末尾加 `…` |
+| 最后提示 | `last_prompt`（缺失时回退 `last_question`） | 原样，超过 60 字截断加 `…` |
 | AI 执行摘要 | `tool_counts` | 按次数降序：`Edit×27 / Read×24 / Bash×23` |
 | 文件编辑 | `files_edited` | `{N} 个文件`（N 为 `len(files_edited)`）；无编辑时显示 `-` |
-| Subagent | `subagents` `subagent_tokens` | `{N} 个 agent`；无 subagent 时显示 `-` |
+| Subagent | `subagent_count` `subagent_tokens` | `{N} 个 agent`；无 subagent 时显示 `-` |
 | Token 用量 | `tokens` `subagent_tokens` | `in:{main_in:,}+{sub_in:,} / out:{main_out:,}+{sub_out:,} / cc:{main_cc:,}+{sub_cc:,} / cr:{main_cr:,}+{sub_cr:,}`；subagent 各维度为 0 时省略 `+0` 部分 ； 数值自动适配 k/m/g 单位展示，保留 1 位小数|
 
 ### `/ccsession list` 执行流程
 
 1. 解析 `--project`，缺省取用户当前 `$PWD`。
 2. 调 `parse_sessions.py --mode summary --format json`，获取 JSON 数组。
-3. 对每个会话生成问题摘要。
+3. 对每个会话按"会话摘要生成规则"一行润色（脚本已提供 `raw_summary` / `commits` / `last_prompt` / `first_question` 候选）。
 4. 按表格行格式渲染每个会话（多行表格 + 表头）。
 5. 多个会话时，底部加合计 tokens 行（合计包含 subagent tokens）。
 6. 作为文本回复发出。
@@ -76,29 +76,25 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 ### `/ccsession show <sessionId>` 执行流程
 
 1. 调 `parse_sessions.py --mode detail --session <id> --format json`，获取 JSON 对象。
-2. 生成问题摘要。
+2. 按"会话摘要生成规则"生成会话摘要。
 3. **第一部分：单行摘要表格**（与 list 行格式完全一致，只有一行）。
    ```
    # 会话详情 — `{session_id}`
 
-   | 会话ID | 模型 | 时间 | 问题摘要 | 首个问题 | 最后问题 | AI 执行摘要 | 文件编辑 | Subagent | Token 用量 |
+   | 会话ID | 模型 | 时间 | 会话摘要 | 首个问题 | 最后提示 | AI 执行摘要 | 文件编辑 | Subagent | Token 用量 |
    |---|---|---|---|---|---|---|---|---|---|
    | 927d520f | ... | ... | ... | ... | ... | ... | ... | ... | ... |
    ```
 4. **第二部分：API 错误**（仅当 `api_errors > 0` 时展示）
    ```
    ## API 错误
-   - 错误 {api_errors} 次：{status×count / ...}
-   - 重试 {api_retries} 次，总等待 {api_retry_wait_ms/1000:.1f}s
+   - 错误 {api_errors} 次，重试 {api_retries} 次
    ```
-5. **第三部分：用户提问**
-   每条提问前加 `[模式]` 标识，模式来自 `question_modes` 数组（与 `all_questions` 一一对应）
-
+5. **第三部分：本会话提交**（仅当 `commits` 非空时展示）
    ```
-   ## 用户提问
-   1. [plan] 第一个问题内容（截断 200 字）
-   2. [acceptEdits] `/ccsession list`（slash command 简写）
-   3. [default] 怎么markdown格式显示都不正常了？
+   ## 本会话提交 ({N} 个)
+   1. {hash} {subject}
+   2. {hash} {subject}
    ...
    ```
 6. **第四部分：文件编辑**（仅当 `files_edited` 非空时展示）
@@ -108,15 +104,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
    2. path/to/file2
    ...
    ```
-7. **第五部分：Subagent**（仅当 `subagents` 非空时展示）
+7. **第五部分：Subagent**（仅当 `subagent_count > 0` 时展示）
    ```
-   ## Subagent ({N} 个)
-   | Agent 类型 | 描述 | Token 用量 |
-   |---|---|---|
-   | Explore | 探索模型测试端点 | in:12k / out:3k |
-   | Plan | 设计实现方案 | in:8k / out:2k |
+   ## Subagent
+   共 {subagent_count} 个 subagent，总 tokens：in:{sub_in:,} / out:{sub_out:,} / cc:{sub_cc:,} / cr:{sub_cr:,}
    ```
-   Token 用量格式：`in:{in:,} / out:{out:,}`，cc/cr 为 0 时省略。
+   cc/cr 为 0 时省略对应部分。
 8. **第六部分：AI 执行步骤**（默认前 3 步，末尾提示"共 N 步，加 `--full` 查看全部"）
    不带 `--full` 时，JSON 中 `steps` 只含前 3 条，`total_steps` 字段为实际总数。用 `total_steps` 计算剩余步数。
    ```
@@ -180,12 +173,19 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/find_orphans.py"    --project <路径> --mo
 
 ---
 
-## 问题摘要生成规则
+## 会话摘要生成规则
 
-- 综合会话中所有用户提问，归纳为一句中文描述
-- 不超过 60 字
-- 突出核心任务/意图，忽略技术细节和 slash command 调用
-- 如果问题只有 1 个，直接精简该问题即可
+按以下优先级取材并生成 1 句中文（≤60 字）：
+
+1. **若 `raw_summary` 非空** → 直接精简到 ≤60 字（去掉模型话术）。
+2. **若 `commits` 非空** → 用 commit 的 `subject` 作为主信号，一句话归纳"做了什么"（多个 commit 合并叙述）。这是最权威的事实信号。
+3. **若 `last_prompt` 非空** → 综合 `last_prompt` 与 `first_question`，写成"用户想做 X，最终聚焦到 Y"。
+4. **否则** → 综合 `first_question` + `last_question` + `tool_counts` 得出最贴切的一句话。
+
+要求：
+- 突出"实际产出"或"目标意图"，不要罗列工具调用次数。
+- 不超过 60 字。
+- 不出现 slash command 字面（如 `/ccsession list`），用其语义替代。
 
 ## 工具分类规则（用于 AI 执行摘要）
 

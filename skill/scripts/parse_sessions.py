@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,11 +60,13 @@ class SessionStats:
     slug: str = ""
     start: str = ""
     end: str = ""
+    cwd: str = ""  # 用于 git log 区间查询
     user_turns: int = 0
     first_question: str = ""
     last_question: str = ""
-    all_questions: list[str] = field(default_factory=list)
-    question_modes: list[str] = field(default_factory=list)
+    last_prompt: str = ""  # 来自 type==last-prompt 条目的 lastPrompt（比尾部 user 行更准）
+    raw_summary: str = ""  # 来自 type==summary 条目（旧版 /compact 兜底，多数为空）
+    commits: list[dict] = field(default_factory=list)  # [{"hash","subject"}]，会话期间 cwd 的 commits
     tool_counts: dict[str, int] = field(default_factory=dict)
     steps: list[Step] = field(default_factory=list)
     tokens: dict[str, int] = field(
@@ -73,15 +76,13 @@ class SessionStats:
     # 注：token 去重依赖 requestId，无 requestId 的 assistant 记录会被重复计数（影响 <1%）
     models: set[str] = field(default_factory=set)
     # Subagent
-    subagents: list[dict] = field(default_factory=list)
+    subagent_count: int = 0
     subagent_tokens: dict[str, int] = field(
         default_factory=lambda: {"in": 0, "out": 0, "cc": 0, "cr": 0}
     )
     # API errors
     api_errors: int = 0
-    api_error_types: dict[str, int] = field(default_factory=dict)
     api_retries: int = 0
-    api_retry_wait_ms: int = 0
     # File edits
     files_edited: list[str] = field(default_factory=list)
 
@@ -149,18 +150,29 @@ def aggregate(path: Path) -> SessionStats:
             s.end = ts
         if not s.slug and rec.get("slug"):
             s.slug = rec["slug"]
+        if not s.cwd and rec.get("cwd"):
+            s.cwd = rec["cwd"]
 
         t = rec.get("type")
 
         # API error detection
         if rec.get("apiErrorStatus"):
             s.api_errors += 1
-            status = str(rec["apiErrorStatus"])
-            s.api_error_types[status] = s.api_error_types.get(status, 0) + 1
 
         if t == "system" and rec.get("subtype") == "api_error":
             s.api_retries += 1
-            s.api_retry_wait_ms += int(rec.get("retryInMs", 0) or 0)
+
+        # 旧版 /compact 在 jsonl 里写过 type==summary 行；新版未见，但保留兜底
+        if t == "summary":
+            summary_text = rec.get("summary") or ""
+            if summary_text and not s.raw_summary:
+                s.raw_summary = summary_text.strip().replace("\n", " ")[:400]
+
+        # Claude Code 主动落盘的"该会话最后一条用户提示"
+        if t == "last-prompt":
+            lp = rec.get("lastPrompt") or ""
+            if lp:
+                s.last_prompt = lp.strip().replace("\n", " ")
 
         if t == "user":
             msg = rec.get("message") or {}
@@ -169,8 +181,6 @@ def aggregate(path: Path) -> SessionStats:
                 q = content.strip().replace("\n", " ")
                 if is_real_question(q):
                     s.user_turns += 1
-                    s.all_questions.append(q)
-                    s.question_modes.append(rec.get("permissionMode", "default"))
                     if not s.first_question:
                         s.first_question = q[:80] + ("…" if len(q) > 80 else "")
                     s.last_question = q[:80] + ("…" if len(q) > 80 else "")
@@ -208,15 +218,40 @@ def aggregate(path: Path) -> SessionStats:
                         s.tool_counts[f"ServerTool[{sname}]"] = s.tool_counts.get(f"ServerTool[{sname}]", 0) + 1
 
     # Subagent analysis
-    s.subagents, s.subagent_tokens = _analyze_subagents(path.parent, s.session_id)
+    s.subagent_count, s.subagent_tokens = _analyze_subagents(path.parent, s.session_id)
+    # 会话期间 cwd 内的 git commits（最权威的"做了什么"信号）
+    fetch_commits_from_git(s)
     return s
 
 
-def _analyze_subagents(session_dir: Path, session_id: str) -> tuple[list[dict], dict[str, int]]:
+# git commit message 比 jsonl 中的 Bash 命令字符串好抠（heredoc 形式无法稳定 regex）
+def fetch_commits_from_git(stats: SessionStats) -> None:
+    if not (stats.cwd and stats.start and stats.end):
+        return
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", stats.cwd, "log",
+                f"--since={stats.start}", f"--until={stats.end}",
+                "--format=%h%x09%s", "--no-merges",
+            ],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return
+    if result.returncode != 0:
+        return
+    for line in result.stdout.strip().splitlines():
+        if "\t" in line:
+            h, subj = line.split("\t", 1)
+            stats.commits.append({"hash": h, "subject": subj[:120]})
+
+
+def _analyze_subagents(session_dir: Path, session_id: str) -> tuple[int, dict[str, int]]:
     sub_dir = session_dir / session_id / "subagents"
     if not sub_dir.is_dir():
-        return [], {"in": 0, "out": 0, "cc": 0, "cr": 0}
-    agents = []
+        return 0, {"in": 0, "out": 0, "cc": 0, "cr": 0}
+    count = 0
     totals = {"in": 0, "out": 0, "cc": 0, "cr": 0}
     for meta_file in sorted(sub_dir.glob("agent-*.meta.json")):
         try:
@@ -225,12 +260,7 @@ def _analyze_subagents(session_dir: Path, session_id: str) -> tuple[list[dict], 
             continue
         agent_id = meta_file.stem.replace("agent-", "").removesuffix(".meta")
         jsonl_file = sub_dir / f"agent-{agent_id}.jsonl"
-        info = {
-            "id": agent_id,
-            "type": meta.get("agentType", "?"),
-            "desc": meta.get("description", ""),
-            "tokens": {"in": 0, "out": 0, "cc": 0, "cr": 0},
-        }
+        agent_tokens = {"in": 0, "out": 0, "cc": 0, "cr": 0}
         if jsonl_file.exists():
             seen: set[str] = set()
             for rec in iter_jsonl(jsonl_file):
@@ -244,14 +274,14 @@ def _analyze_subagents(session_dir: Path, session_id: str) -> tuple[list[dict], 
                 if rid:
                     seen.add(rid)
                 u = (rec.get("message") or {}).get("usage") or {}
-                info["tokens"]["in"] += u.get("input_tokens", 0) or 0
-                info["tokens"]["out"] += u.get("output_tokens", 0) or 0
-                info["tokens"]["cc"] += u.get("cache_creation_input_tokens", 0) or 0
-                info["tokens"]["cr"] += u.get("cache_read_input_tokens", 0) or 0
-        agents.append(info)
+                agent_tokens["in"] += u.get("input_tokens", 0) or 0
+                agent_tokens["out"] += u.get("output_tokens", 0) or 0
+                agent_tokens["cc"] += u.get("cache_creation_input_tokens", 0) or 0
+                agent_tokens["cr"] += u.get("cache_read_input_tokens", 0) or 0
+        count += 1
         for k in totals:
-            totals[k] += info["tokens"][k]
-    return agents, totals
+            totals[k] += agent_tokens[k]
+    return count, totals
 
 
 def summary_line(tc: dict[str, int]) -> str:
@@ -365,14 +395,15 @@ def render_detail(s: SessionStats, full: bool = False, step_preview: int = 3) ->
         f"/ cache_creation {s.tokens['cc']:,} / cache_read {s.tokens['cr']:,}"
     )
     out.append(f"- **AI 执行摘要**: {summary_line(s.tool_counts)}")
+    if s.commits:
+        commit_line = " ; ".join(f"{c['hash']} {c['subject']}" for c in s.commits[:5])
+        if len(s.commits) > 5:
+            commit_line += f" …(+{len(s.commits) - 5})"
+        out.append(f"- **本会话提交**: {commit_line}")
+    if s.last_prompt:
+        lp = s.last_prompt if len(s.last_prompt) <= 200 else s.last_prompt[:200] + "…"
+        out.append(f"- **最后提示**: {lp}")
     out.append("")
-
-    if s.all_questions:
-        out.append("## 用户提问")
-        for i, q in enumerate(s.all_questions, 1):
-            snippet = q if len(q) <= 200 else q[:200] + "…"
-            out.append(f"{i}. {snippet}")
-        out.append("")
 
     out.append("## AI 执行步骤")
     if not s.steps:
@@ -390,6 +421,37 @@ def render_detail(s: SessionStats, full: bool = False, step_preview: int = 3) ->
                 f"加 `--full` 查看全部：`/ccsession show {s.session_id} --full`_"
             )
     return "\n".join(out)
+
+
+def _session_to_dict(s: SessionStats, detail: bool = False, full: bool = False) -> dict:
+    """构造给 Claude 渲染的 JSON。字段已按"会话摘要新流水线"精简。"""
+    d = {
+        "session_id": s.session_id,
+        "models": sorted(s.models),
+        "start": s.start,
+        "end": s.end,
+        "duration": fmt_duration(s.start, s.end),
+        "user_turns": s.user_turns,
+        "first_question": s.first_question,
+        "last_question": s.last_question,
+        "last_prompt": s.last_prompt,
+        "raw_summary": s.raw_summary,
+        "commits": s.commits,
+        "tool_counts": s.tool_counts,
+        "tokens": s.tokens,
+        "subagent_count": s.subagent_count,
+        "subagent_tokens": s.subagent_tokens,
+        "api_errors": s.api_errors,
+        "api_retries": s.api_retries,
+        "files_edited": s.files_edited,
+        "corrupted_lines": s.corrupted_lines,
+    }
+    if detail:
+        d["slug"] = s.slug
+        steps_view = s.steps if full else s.steps[:3]
+        d["steps"] = [{"ts": st.ts, "name": st.name, "detail": st.detail} for st in steps_view]
+        d["total_steps"] = len(s.steps)
+    return d
 
 
 def main() -> int:
@@ -427,30 +489,7 @@ def main() -> int:
 
         rows.sort(key=sort_key, reverse=args.desc)
         if args.format == "json":
-            data = []
-            for s in rows:
-                data.append({
-                    "session_id": s.session_id,
-                    "models": sorted(s.models),
-                    "start": s.start,
-                    "end": s.end,
-                    "duration": fmt_duration(s.start, s.end),
-                    "user_turns": s.user_turns,
-                    "all_questions": [q[:200] + ("…" if len(q) > 200 else "") for q in s.all_questions],
-                    "question_modes": s.question_modes,
-                    "first_question": s.first_question,
-                    "last_question": s.last_question,
-                    "tool_counts": s.tool_counts,
-                    "tokens": s.tokens,
-                    "subagents": s.subagents,
-                    "subagent_tokens": s.subagent_tokens,
-                    "api_errors": s.api_errors,
-                    "api_error_types": s.api_error_types,
-                    "api_retries": s.api_retries,
-                    "api_retry_wait_ms": s.api_retry_wait_ms,
-                    "files_edited": s.files_edited,
-                    "corrupted_lines": s.corrupted_lines,
-                })
+            data = [_session_to_dict(s) for s in rows]
             print(json.dumps(data, ensure_ascii=False, indent=2))
         else:
             print(render_summary(args.project, rows))
@@ -467,32 +506,7 @@ def main() -> int:
         return 1
     stats = aggregate(target)
     if args.format == "json":
-        detail_data = {
-            "session_id": stats.session_id,
-            "slug": stats.slug,
-            "models": sorted(stats.models),
-            "start": stats.start,
-            "end": stats.end,
-            "duration": fmt_duration(stats.start, stats.end),
-            "user_turns": stats.user_turns,
-            "all_questions": [q[:200] + ("…" if len(q) > 200 else "") for q in stats.all_questions],
-            "question_modes": stats.question_modes,
-            "first_question": stats.first_question,
-            "last_question": stats.last_question,
-            "tool_counts": stats.tool_counts,
-            "steps": [{"ts": st.ts, "name": st.name, "detail": st.detail}
-                       for st in (stats.steps if args.full else stats.steps[:3])],
-            "total_steps": len(stats.steps),
-            "tokens": stats.tokens,
-            "subagents": stats.subagents,
-            "subagent_tokens": stats.subagent_tokens,
-            "api_errors": stats.api_errors,
-            "api_error_types": stats.api_error_types,
-            "api_retries": stats.api_retries,
-            "api_retry_wait_ms": stats.api_retry_wait_ms,
-            "files_edited": stats.files_edited,
-            "corrupted_lines": stats.corrupted_lines,
-        }
+        detail_data = _session_to_dict(stats, detail=True, full=args.full)
         print(json.dumps(detail_data, ensure_ascii=False, indent=2))
     else:
         print(render_detail(stats, full=args.full))
