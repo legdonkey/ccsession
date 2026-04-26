@@ -62,8 +62,10 @@ ln -s /path/to/ccsession/skill ~/.claude/skills/ccsession
 ### 直接运行脚本
 
 ```bash
-# 摘要
+# 摘要（默认线程池并发，会话越多越明显）
 python3 skill/scripts/parse_sessions.py --project /path/to/project --mode summary --format json
+python3 skill/scripts/parse_sessions.py --project /path/to/project --mode summary --format json --workers 1   # 强制串行
+python3 skill/scripts/parse_sessions.py --project /path/to/project --mode summary --format json --workers 16  # 自定义并发数
 
 # 详情（默认 3 步）
 python3 skill/scripts/parse_sessions.py --project /path/to/project \
@@ -141,3 +143,14 @@ Python 3 标准库，无第三方包。
 3. `[19:33:42]` **Edit** — middleware/auth.go
 
 _…共 58 步，还有 55 步未展示。加_ _`--full`_ _查看全部：`/ccsession show a3b370e5 --full`_
+
+## 修改日志
+
+| 日期 | 变更类型 | 变更描述 |
+|---|---|---|
+| 2026-04-26 | 性能优化 | summary 模式默认线程池并发聚合（每个会话独立 IO + git log 子进程），新增 `--workers` 参数（0=自动 `min(8, cpu)`、1=串行）；本机 10 个会话实测 0.31s → 0.20s |
+| 2026-04-26 | 功能精修 | 会话摘要不限字数、SKILL.md 改写为 Prompt 模板；`first_question` / `last_prompt` 不截断；恢复 Subagent 子表格；`raw_summary` 改从 `type==user + isCompactSummary` 抽取（即 `/compact` 留下的前序压缩） |
+| 2026-04-26 | 重构 | 会话摘要改为"事实优先"流水线：脚本承担事实抽取（git commits、last-prompt），AI 综合生成；JSON 字段精简（删 `all_questions` / `question_modes` / `api_error_types` 等冗余） |
+| 2026-04-25 | 新功能 | `procs` / `kill` 子命令：发现并清理 Claude Code 退出后留下的孤儿子进程（pgid > 1 走 killpg 整组发，dev server 三层 fork 链一次到位） |
+| 2026-04-25 | 功能调整 | list/show 摘要表格新增「最后问题 / 最后提示」列 |
+| 2026-04-19 | 初始版本 | 首发 ccsession Skill：list / show / delete 三个子命令，jsonl 解析、Token 统计（含 subagent）、API 错误追踪、文件编辑追踪 |

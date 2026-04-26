@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -447,6 +449,29 @@ def render_detail(s: SessionStats, full: bool = False, step_preview: int = 3) ->
     return "\n".join(out)
 
 
+def _aggregate_safe(path: Path) -> SessionStats:
+    """aggregate() 包一层异常隔离——单个会话解析失败不拖垮整批。"""
+    try:
+        return aggregate(path)
+    except Exception as e:
+        # 占位 stub，至少有 session_id 让上层渲染不崩
+        s = SessionStats(session_id=path.stem)
+        s.corrupted_lines = -1  # 用 -1 标记"整文件解析失败"
+        print(f"[warn] aggregate failed for {path.name}: {e}", file=sys.stderr)
+        return s
+
+
+def _aggregate_all(files: list[Path], workers: int) -> list[SessionStats]:
+    """summary 模式批量聚合：每个会话独立、IO 重，用线程池并发。"""
+    if workers <= 0:
+        workers = min(8, (os.cpu_count() or 4))
+    if workers <= 1 or len(files) <= 1:
+        return [_aggregate_safe(f) for f in files]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        # executor.map 保持输入顺序
+        return list(ex.map(_aggregate_safe, files))
+
+
 def _session_to_dict(s: SessionStats, detail: bool = False, full: bool = False) -> dict:
     """构造给 Claude 渲染的 JSON。字段已按"会话摘要新流水线"精简。"""
     d = {
@@ -489,6 +514,8 @@ def main() -> int:
     ap.add_argument("--sort", choices=["start", "end", "turns", "duration"], default="start",
                     help="summary 排序字段（默认 start）")
     ap.add_argument("--desc", action="store_true", help="降序排列（默认升序）")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="summary 模式并发线程数；0=自动（min(8, cpu)），1=串行")
     args = ap.parse_args()
 
     pdir = project_dir(args.project)
@@ -499,7 +526,7 @@ def main() -> int:
         return 0
 
     if args.mode == "summary":
-        rows = [aggregate(f) for f in files]
+        rows = _aggregate_all(files, args.workers)
 
         def sort_key(s: SessionStats):
             if args.sort == "turns":
